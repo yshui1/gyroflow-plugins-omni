@@ -47,7 +47,6 @@ pub enum Params {
     InputRotation,
     Rotation,
     VideoSpeed,
-    DisableStretch,
     IntegrationMethod,
     SqueezeRatio,
     CustomSqueezeRatio,
@@ -103,19 +102,6 @@ impl Default for GyroflowPluginBase {
 }
 
 impl GyroflowPluginBase {
-    /// If `disable_stretch` is true, inject a `plugin_disable_stretch` flag into gyroflow JSON data
-    /// so that the setting persists when the data is embedded in a preset or project.
-    fn maybe_inject_disable_stretch(data: &str, disable_stretch: bool) -> String {
-        if !disable_stretch { return data.to_string(); }
-        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(data) {
-            json["plugin_disable_stretch"] = serde_json::Value::Bool(true);
-            if let Ok(s) = serde_json::to_string(&json) {
-                return s;
-            }
-        }
-        data.to_string()
-    }
-
     /// Marks `data`, a preset or a lens profile loaded with "Load preset/lens profile", as loaded over a project. One loaded
     /// over the video doesn't apply over a project loaded after it: the project made in the app has its settings then
     pub fn mark_loaded_over_project(data: &str) -> String {
@@ -158,7 +144,7 @@ impl GyroflowPluginBase {
                 }
             }
         };
-        copy(None, &["version", "calibration_data", "light_refraction_coefficient", "plugin_disable_stretch", "keyframes",
+        copy(None, &["version", "calibration_data", "light_refraction_coefficient", "keyframes",
                      "background_color", "background_mode", "background_margin", "background_margin_feather"]);
         copy(Some("gyro_source"), &["lpf", "mf", "rotation", "acc_rotation", "gyro_bias", "imu_orientation", "integration_method"]);
         copy(Some("synchronization"), &["initial_offset", "initial_offset_inv", "search_size", "calc_initial_fast", "max_sync_points",
@@ -504,7 +490,6 @@ impl GyroflowPluginBase {
                 ParameterType::Slider   { id: "InputRotation",          label: "Input rotation",       hint: "Input rotation",               min: -360.0, max: 360.0, default: 0.0 },
                 ParameterType::Slider   { id: "Fov",                    label: "FOV",                  hint: "FOV",                          min: 0.1,    max: 3.0,   default: 1.0 },
                 ParameterType::Slider   { id: "VideoSpeed",             label: "Video speed",          hint: "Use this slider to change video speed or keyframe it, instead of built-in speed changes in the editor", min: 0.0001, max: 1000.0, default: 100.0 },
-                ParameterType::Checkbox { id: "DisableStretch",         label: "Disable Gyroflow's stretch", hint: "If you used Input stretch in the lens profile in Gyroflow, and you de-stretched the video separately in your editor (by setting anamorphic squeeze factor), check this to disable Gyroflow's internal stretching.", default: false },
                 ParameterType::Select   { id: "Zooming",                label: "Zooming",              hint: "Static zooming uses one crop for the clip. Dynamic zooming adapts the crop with a 4-second smoothing window.", options: vec!["Static zooming", "Dynamic zooming"], default: "Static zooming" },
                 ParameterType::Select   { id: "IntegrationMethod",      label: "Integration method",   hint: "IMU integration method", options: vec!["None", "Complementary", "VQF", "Simple gyro", "Simple gyro + accel", "Mahony", "Madgwick"], default: "VQF" },
                 ParameterType::Select   { id: "SqueezeRatio",       label: "Input horizontal stretch",       hint: "Initialized from input_horizontal_stretch in the lens profile. Describes the recorded sensor's horizontal axis before video rotation. Used with vertical stretch for anamorphic framing and the crop guide; does not de-squeeze the image.", options: vec!["1.0x (Default)", "1.25x", "1.3x", "1.33x", "1.5x", "1.6x", "1.7x", "1.8x", "1.85x", "2x", "Custom"], default: "1.0x (Default)" },
@@ -755,7 +740,6 @@ impl GyroflowPluginBaseInstance {
         let _ = params.set_enabled(Params::AdditionalYaw, loaded);
         let _ = params.set_enabled(Params::Rotation, loaded);
         let _ = params.set_enabled(Params::VideoSpeed, loaded);
-        let _ = params.set_enabled(Params::DisableStretch, loaded);
         let _ = params.set_enabled(Params::Zooming, loaded);
         let _ = params.set_enabled(Params::IntegrationMethod, loaded);
         // Squeeze framing controls work regardless of gyro loading; only the
@@ -1128,11 +1112,11 @@ impl GyroflowPluginBaseInstance {
         }
     }
 
-    /// The key of the stabilization the instance renders with, in `managers` and the manager cache: of the project, loaded
-    /// with Disable stretch or not, both input stretch axes, and the instance id.
+    /// The key of the stabilization the instance renders with, in `managers` and the manager cache: of the project, both input
+    /// stretch axes, and the instance id.
     /// The instances that share it share the instance id (see `ever_changed`)
     pub fn stab_key(params: &dyn GyroflowPluginParams) -> PluginResult<String> {
-        Ok(format!("{}{}{}:{}:{}", params.get_string(Params::ProjectPath)?, params.get_bool(Params::DisableStretch)?, params.get_string(Params::InstanceId)?, GyroflowPluginBase::get_squeeze(params), GyroflowPluginBase::get_vertical_stretch(params)))
+        Ok(format!("{}{}:{}:{}", params.get_string(Params::ProjectPath)?, params.get_string(Params::InstanceId)?, GyroflowPluginBase::get_squeeze(params), GyroflowPluginBase::get_vertical_stretch(params)))
     }
 
     /// Whether an edit of `param` changes what the instance sets up its stabilization with (see `configure`), which it
@@ -1280,8 +1264,6 @@ impl GyroflowPluginBaseInstance {
     }
 
     pub fn stab_manager(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, out_size: (usize, usize), open_gyroflow_if_no_data: bool) -> PluginResult<Arc<StabilizationManager>> {
-        let mut disable_stretch = params.get_bool(Params::DisableStretch)?;
-
         let path = params.get_string(Params::ProjectPath)?;
         if path.is_empty() {
             self.update_loaded_state(params, false);
@@ -1352,7 +1334,6 @@ impl GyroflowPluginBaseInstance {
                         }
                         if params.get_bool(Params::IncludeProjectData)? {
                             if let Ok(data) = stab.export_gyroflow_data(gyroflow_core::GyroflowProjectType::WithGyroData, "{}", None) {
-                                let data = GyroflowPluginBase::maybe_inject_disable_stretch(&data, disable_stretch);
                                 params.set_string(Params::ProjectData, &data)?;
                             }
                         }
@@ -1514,48 +1495,6 @@ impl GyroflowPluginBaseInstance {
             };
 
             self.update_loaded_state(params, loaded);
-
-            // Check if loaded preset/project/lens data contains the plugin_disable_stretch flag
-            if !disable_stretch {
-                let has_flag = |d: &str| -> bool {
-                    serde_json::from_str::<serde_json::Value>(d).ok()
-                        .and_then(|v| v.get("plugin_disable_stretch").and_then(|v| v.as_bool()))
-                        .unwrap_or(false)
-                };
-                for param_id in [Params::EmbeddedLensProfile, Params::EmbeddedPreset, Params::ProjectData] {
-                    if let Ok(d) = params.get_string(param_id) {
-                        if !d.is_empty() && has_flag(&d) {
-                            disable_stretch = true;
-                            let _ = params.set_bool(Params::DisableStretch, true);
-                            break;
-                        }
-                    }
-                }
-                // Also check default.gyroflow, which gyroflow-core auto-loads inside
-                // load_video_file but never exposes through the plugin's Embedded* params.
-                // Paths and fallback order match `StabilizationManager::load_video_file`.
-                if !disable_stretch {
-                    let paths = [
-                        gyroflow_core::settings::data_dir().join("lens_profiles").join("default.gyroflow"),
-                        gyroflow_core::lens_profile_database::LensProfileDatabase::get_path().join("default.gyroflow"),
-                    ];
-                    for path in &paths {
-                        if let Ok(d) = std::fs::read_to_string(path) {
-                            if has_flag(&d) {
-                                disable_stretch = true;
-                                let _ = params.set_bool(Params::DisableStretch, true);
-                                break;
-                            }
-                            // Matches core: stop after the first existing path (settings preferred).
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if disable_stretch {
-                stab.disable_lens_stretch(self.anamorphic_adjust_size);
-            }
 
             self.configure(params, &stab, out_size, true)?;
 
@@ -1781,17 +1720,14 @@ impl GyroflowPluginBaseInstance {
         }
         if param == Params::IncludeProjectData {
             let path = params.get_string(Params::ProjectPath)?;
-            let ds = params.get_bool(Params::DisableStretch).unwrap_or(false);
             if params.get_bool(Params::IncludeProjectData).unwrap_or_default() {
                 if path.ends_with(".gyroflow") {
                     if let Ok(data) = std::fs::read_to_string(&path) {
                         if StabilizationManager::project_has_motion_data(data.as_bytes()) {
-                            let data = GyroflowPluginBase::maybe_inject_disable_stretch(&data, ds);
                             params.set_string(Params::ProjectData, &data)?;
                         } else {
                             if let Some((_, stab)) = self.managers.peek_lru() {
                                 if let Ok(data) = stab.export_gyroflow_data(gyroflow_core::GyroflowProjectType::WithGyroData, "{}", None) {
-                                    let data = GyroflowPluginBase::maybe_inject_disable_stretch(&data, ds);
                                     params.set_string(Params::ProjectData, &data)?;
                                 }
                             }
@@ -1802,7 +1738,6 @@ impl GyroflowPluginBaseInstance {
                 } else {
                     if let Some((_, stab)) = self.managers.peek_lru() {
                         if let Ok(data) = stab.export_gyroflow_data(gyroflow_core::GyroflowProjectType::WithGyroData, "{}", None) {
-                            let data = GyroflowPluginBase::maybe_inject_disable_stretch(&data, ds);
                             params.set_string(Params::ProjectData, &data)?;
                         }
                     }
@@ -2272,8 +2207,8 @@ mod tests {
     }
 
     #[test]
-    fn ofx_disabled_stretch_load_preserves_recorded_bounds_on_both_axes() {
-        for disable_stretch in [false, true] {
+    fn ofx_load_preserves_recorded_bounds_on_both_axes() {
+        {
             for (lens, rotation, timeline, expected_input) in [
                 (include_str!("../tests/fixtures/sony_aivascope_vertical_1_5x.json"), 270.0, (3240, 3840), (540, 0, 2160, 3840)),
                 (include_str!("../tests/fixtures/sony_aivascope_vertical_1_5x.json"), 90.0, (1080, 1920), (0, 0, 1080, 1920)),
@@ -2283,7 +2218,6 @@ mod tests {
                 params.set_f64(Params::InputRotation, rotation).unwrap();
                 params.set_f64(Params::Fov, 1.0).unwrap();
                 params.set_i32(Params::Interpolation, 2).unwrap();
-                params.set_bool(Params::DisableStretch, disable_stretch).unwrap();
                 params.set_bool(Params::IncludeProjectData, true).unwrap();
                 params.set_string(Params::ProjectData, &serde_json::json!({
                     "version": 4,
@@ -2421,7 +2355,6 @@ mod tests {
         let mut params = params();
         params.set_string(Params::ProjectPath, &std::env::var("GYROFLOW_VERTICAL_SAMPLE").expect("set GYROFLOW_VERTICAL_SAMPLE")).unwrap();
         params.set_string(Params::EmbeddedLensProfile, include_str!("../tests/fixtures/sony_aivascope_vertical_1_5x.json")).unwrap();
-        params.set_bool(Params::DisableStretch, true).unwrap();
         params.set_f64(Params::Fov, 1.0).unwrap();
         params.set_f64(Params::ZoomLimit, 130.0).unwrap();
         params.set_i32(Params::Zooming, 1).unwrap();

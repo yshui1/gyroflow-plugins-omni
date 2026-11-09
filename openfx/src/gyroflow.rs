@@ -48,7 +48,6 @@ define_params!(ParamHandler {
         LoadedLens          => loaded_lens:      ParamHandle<String>,
     ],
     bools: [
-        DisableStretch        => disable_stretch:         ParamHandle<bool>,
         ToggleOverview        => toggle_overview:         ParamHandle<bool>,
         DontDrawOutside       => dont_draw_outside:       ParamHandle<bool>,
         IncludeProjectData    => include_project_data:    ParamHandle<bool>,
@@ -464,7 +463,6 @@ impl Execute for GyroflowPlugin {
                         squeeze_border:           param_set.parameter("SqueezeBorder")?,
                         vertical_stretch_control_version: param_set.parameter("VerticalStretchControlVersion")?,
                         project_path:             param_set.parameter("ProjectPath")?,
-                        disable_stretch:          param_set.parameter("DisableStretch")?,
                         status:                   param_set.parameter("Status")?,
                         open_in_gyroflow:         param_set.parameter("OpenGyroflow")?,
                         reload_project:           param_set.parameter("ReloadProject")?,
