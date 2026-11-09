@@ -8,7 +8,7 @@ use telemetry_parser::util::VideoMetadata;
 
 pub fn get_video_metadata<T: Read + Seek>(
     stream: &mut T,
-    filesize: usize,
+    filesize: u64,
     url: &str,
 ) -> Result<VideoMetadata, GyroflowCoreError> {
     let filename = filesystem::get_filename(url);
@@ -33,7 +33,7 @@ pub fn get_video_metadata<T: Read + Seek>(
 pub fn load_video_file<T: Read + Seek>(
     stab: &StabilizationManager,
     stream: &mut T,
-    filesize: usize,
+    filesize: u64,
     url: &str,
 ) -> Result<VideoMetadata, GyroflowCoreError> {
     let metadata = get_video_metadata(stream, filesize, url)?;
@@ -68,7 +68,7 @@ mod tests {
             for extension in ["NEV", "nev", "R3D", "r3d"] {
                 let url = filesystem::path_to_url(&format!("C:/clip.{extension}"));
                 let mut stream = Cursor::new(&bytes);
-                let metadata = get_video_metadata(&mut stream, bytes.len(), &url).unwrap();
+                let metadata = get_video_metadata(&mut stream, bytes.len() as u64, &url).unwrap();
                 assert_eq!((metadata.width, metadata.height), (16, 16));
                 assert!((metadata.fps - 24000.0 / 1001.0).abs() < 1e-6);
                 assert!((metadata.duration_s - 2.0 * 1001.0 / 24000.0).abs() < 1e-6);
@@ -112,7 +112,7 @@ mod tests {
             let path = std::path::Path::new(&directory).join(name);
             let url = filesystem::path_to_url(&path.to_string_lossy());
             let mut stream = std::fs::File::open(&path).unwrap();
-            let size = stream.metadata().unwrap().len() as usize;
+            let size = stream.metadata().unwrap().len();
             let stab = StabilizationManager::default();
             let metadata = load_video_file(&stab, &mut stream, size, &url).unwrap();
             assert_eq!((metadata.width, metadata.height), (6060, 3410));
