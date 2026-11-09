@@ -7,8 +7,10 @@ use gyroflow_plugin_base::*;
 use gyroflow_plugin_base::parking_lot::{ Mutex, RwLock };
 use gyroflow_plugin_base::lru::LruCache;
 
+const PLUGIN_LABEL: &str = concat!("Gyroflow (Omni) ", env!("CARGO_PKG_VERSION"));
+
 plugin_module!(
-    "xyz.gyroflow",
+    "xyz.gyroflow.omni",
     ApiVersion(1),
     PluginVersion(1, 2),
     GyroflowPlugin::default
@@ -34,6 +36,8 @@ define_params!(ParamHandler {
         ProjectData         => project_data:     ParamHandle<String>,
         EmbeddedLensProfile => embedded_lens:    ParamHandle<String>,
         EmbeddedPreset      => embedded_preset:  ParamHandle<String>,
+        SqueezeBorder       => squeeze_border:   ParamHandle<String>,
+        VerticalStretchControlVersion => vertical_stretch_control_version: ParamHandle<String>,
         ProjectPath         => project_path:     ParamHandle<String>,
         OpenGyroflow        => open_in_gyroflow: ParamHandle<String>,
         ReloadProject       => reload_project:   ParamHandle<String>,
@@ -44,7 +48,6 @@ define_params!(ParamHandler {
         LoadedLens          => loaded_lens:      ParamHandle<String>,
     ],
     bools: [
-        DisableStretch        => disable_stretch:         ParamHandle<bool>,
         ToggleOverview        => toggle_overview:         ParamHandle<bool>,
         DontDrawOutside       => dont_draw_outside:       ParamHandle<bool>,
         IncludeProjectData    => include_project_data:    ParamHandle<bool>,
@@ -66,11 +69,16 @@ define_params!(ParamHandler {
         VideoSpeed            => video_speed:              ParamHandle<Double>,
         OutputWidth           => output_width:             ParamHandle<Double>,
         OutputHeight          => output_height:            ParamHandle<Double>,
+        CustomSqueezeRatio    => custom_squeeze_ratio:     ParamHandle<Double>,
+        InputVerticalStretch  => input_vertical_stretch:   ParamHandle<Double>,
         //FusionStartFrame      => fusion_start_frame:       ParamHandle<Double>,
     ],
     i32s: [
+        Zooming               => zooming:                  ParamHandle<Int>,
         Interpolation         => interpolation:            ParamHandle<Int>,
         IntegrationMethod     => integration_method:       ParamHandle<Int>,
+        SqueezeRatio          => squeeze_ratio:            ParamHandle<Int>,
+        VerticalSqueezeRatio  => vertical_squeeze_ratio:   ParamHandle<Int>,
     ],
 
     get_string:  _s p    { Ok(p.get_value()?) },
@@ -201,11 +209,11 @@ impl Execute for GyroflowPlugin {
                 let params = stab.params.read();
                 let fps = params.fps;
                 let src_fps = instance_data.source_clip.get_frame_rate().unwrap_or(fps);
-                let org_ratio = params.size.0 as f64 / params.size.1 as f64;
-                let (has_accurate_timestamps, has_offsets) = {
+                let video_size = params.size;
+                let (has_accurate_timestamps, has_offsets, has_gyro) = {
                     let gyro = stab.gyro.read();
                     let md = gyro.file_metadata.read();
-                    (md.has_accurate_timestamps, !gyro.get_offsets().is_empty())
+                    (md.has_accurate_timestamps, !gyro.get_offsets().is_empty(), !gyro.quaternions.is_empty())
                 };
 
                 let mut speed_stretch = 1.0;
@@ -225,8 +233,15 @@ impl Execute for GyroflowPlugin {
                     speed_stretch = 1.0;
                 }
 
-                if (src_fps - fps).abs() > 0.01 {
-                    instance_data.plugin.set_status(&mut instance_data.params, "Timeline fps mismatch!", "Timeline frame rate doesn't match the clip frame rate! Use the plugin in Fusion instead", false);
+                // The host may tell which source frame it renders (Resolve does, retimed and conformed clips included): the
+                // timestamps are exact then, whatever the frame rates
+                let src_frame = in_args.get_src_frame().ok();
+
+                if !has_gyro {
+                    instance_data.plugin.set_status(&mut instance_data.params, "No gyro data in this file", "This file has no motion data (a transcode or an export of the original, or a camera without gyro). Use the original camera file, or open it in Gyroflow to load the motion data from another file.", false);
+                } else if (src_fps - fps).abs() > 0.01 && src_frame.is_none() {
+                    let status = format!("Timeline fps mismatch! ({fps:.3} clip, {src_fps:.3} timeline)");
+                    instance_data.plugin.set_status(&mut instance_data.params, &status, "Timeline frame rate doesn't match the clip frame rate! Use the plugin in Fusion instead", false);
                 } else if !has_accurate_timestamps && !has_offsets {
                     instance_data.plugin.set_status(&mut instance_data.params, "Not synced. Open in Gyroflow", "Gyro data is not synced with the video, open the video in Gyroflow and add sync points (eg. by doing autosync)", false);
                 } else {
@@ -244,7 +259,7 @@ impl Execute for GyroflowPlugin {
                     let frame = (time / src_fps) * fps * speed_stretch;
                     timestamp_us = (frame.floor() * (1_000_000.0 / fps)).round() as i64;
                 }
-                if let Ok(frame) = in_args.get_src_frame() {
+                if let Some(frame) = src_frame {
                     timestamp_us = (frame as f64 * (1_000_000.0 / fps)).round() as i64;
                 }
 
@@ -277,37 +292,47 @@ impl Execute for GyroflowPlugin {
                 if src_size.2 <= 0 { src_size.2 = src_size.0 * 4 * 4 }; // assuming 32-bit float
                 if out_size.2 <= 0 { out_size.2 = out_size.0 * 4 * 4 }; // assuming 32-bit float
 
-                let src_rect = GyroflowPluginBase::get_center_rect(src_size.0, src_size.1, org_ratio);
-
-                let mut out_rect = if instance_data.params.get_bool_at_time(Params::DontDrawOutside, TimeType::Frame(time)).unwrap() { // TODO: unwrap
-                    let output_ratio = out_size.0 as f64 / out_size.1 as f64;
-                    let mut rect = GyroflowPluginBase::get_center_rect(src_rect.2, src_rect.3, output_ratio);
-                    rect.0 += src_rect.0;
-                    rect.1 += src_rect.1;
-                    Some(rect)
+                // The clip in the input buffer, turned by the input rotation, and where the stabilized image goes in the output
+                // (Vegas draws over the whole output buffer, see below)
+                let is_vegas = _plugin_context.get_host().get_name().as_deref().ok() == Some("com.vegascreativesoftware.vegas");
+                let input_rotation = instance_data.params.get_f64_at_time(Params::InputRotation, TimeType::Frame(time)).unwrap_or_default();
+                let keep_clip_frame = !is_vegas && instance_data.plugin.keep_clip_frame(&instance_data.params, video_size, input_rotation, (out_size.0, out_size.1));
+                let geometry = GyroflowPluginBase::render_geometry(video_size, input_rotation, (src_size.0, src_size.1), (out_size.0, out_size.1), instance_data.is_fusion_page, keep_clip_frame, true);
+                // The output size has the aspect of what it's drawn into
+                let output_size = if is_vegas {
+                    (instance_data.params.get_f64(Params::OutputWidth).unwrap_or_default() as usize, instance_data.params.get_f64(Params::OutputHeight).unwrap_or_default() as usize)
                 } else {
-                    None
+                    instance_data.plugin.output_size_for(&instance_data.params, video_size, geometry.input_rotation, (out_size.0, out_size.1))
                 };
+                GyroflowPluginBaseInstance::ensure_output_aspect(&stab, output_size);
+                let src_rect = geometry.src_rect;
+                // Of an anamorphic clip, only the part the timeline shows once de-squeezed (the output size has its aspect)
+                let mut out_rect = if is_vegas { geometry.out_rect } else { geometry.out_rect.map(|r| instance_data.plugin.timeline_window_rect(&instance_data.params, r)) };
+
                 let out_scale = output_image.get_render_scale()?;
                 if (out_scale.x != 1.0 || out_scale.y != 1.0) && !in_args.get_opengl_enabled().unwrap_or_default() {
                     // log::debug!("out_scale: {:?}", out_scale);
                     let w = (out_size.0 as f64 * out_scale.x as f64).round() as usize;
                     let h = (out_size.1 as f64 * out_scale.y as f64).round() as usize;
                     if out_size.1 > h {
+                        // The image is in the scaled part of the buffer, the rect it's drawn into scales with it
+                        let (rx, ry, rw, rh) = out_rect.unwrap_or((0, 0, out_size.0, out_size.1));
+                        let sx = w as f64 / out_size.0 as f64;
+                        let sy = h as f64 / out_size.1 as f64;
                         out_rect = Some((
-                            0,
-                            out_size.1 - h, // because the coordinates are inverted
-                            w,
-                            h
+                            (rx as f64 * sx).round() as usize,
+                            out_size.1 - h + (ry as f64 * sy).round() as usize, // because the coordinates are inverted
+                            (rw as f64 * sx).round() as usize,
+                            (rh as f64 * sy).round() as usize
                         ));
                     }
                 }
 
-                if _plugin_context.get_host().get_name().as_deref().ok() == Some("com.vegascreativesoftware.vegas") {
+                if is_vegas {
                     out_rect = None;
                 }
 
-                let input_rotation = instance_data.params.get_f64_at_time(Params::InputRotation, TimeType::Frame(time)).ok().map(|x| x as f32);
+                let input_rotation = Some(geometry.kernel_rotation as f32);
 
                 // log::debug!("src_size: {src_size:?} | src_rect: {src_rect:?}");
                 // log::debug!("out_size: {out_size:?} | out_rect: {out_rect:?}");
@@ -435,8 +460,9 @@ impl Execute for GyroflowPlugin {
                         project_data:             param_set.parameter("ProjectData")?,
                         embedded_lens:            param_set.parameter("EmbeddedLensProfile")?,
                         embedded_preset:          param_set.parameter("EmbeddedPreset")?,
+                        squeeze_border:           param_set.parameter("SqueezeBorder")?,
+                        vertical_stretch_control_version: param_set.parameter("VerticalStretchControlVersion")?,
                         project_path:             param_set.parameter("ProjectPath")?,
-                        disable_stretch:          param_set.parameter("DisableStretch")?,
                         status:                   param_set.parameter("Status")?,
                         open_in_gyroflow:         param_set.parameter("OpenGyroflow")?,
                         reload_project:           param_set.parameter("ReloadProject")?,
@@ -463,6 +489,11 @@ impl Execute for GyroflowPlugin {
                         output_size_fit:          param_set.parameter("OutputSizeToTimeline")?,
                         interpolation:            param_set.parameter("Interpolation")?,
                         integration_method:       param_set.parameter("IntegrationMethod")?,
+                        zooming:                  param_set.parameter("Zooming")?,
+                        squeeze_ratio:            param_set.parameter("SqueezeRatio")?,
+                        custom_squeeze_ratio:     param_set.parameter("CustomSqueezeRatio")?,
+                        input_vertical_stretch:   param_set.parameter("InputVerticalStretch")?,
+                        vertical_squeeze_ratio:   param_set.parameter("VerticalSqueezeRatio")?,
 
                         loaded_project:           param_set.parameter("LoadedProject")?,
                         loaded_lens:              param_set.parameter("LoadedLens")?,
@@ -480,12 +511,19 @@ impl Execute for GyroflowPlugin {
                         num_frames:                  0,
                         fps:                         0.0,
                         reload_values_from_project:  false,
+                        keep_adjustments:            false,
                         ever_changed:                false,
                         opencl_disabled:             false,
                         cache_keyframes_every_frame: true,
                         framebuffer_inverted:        true,
-                        anamorphic_adjust_size:      true,
-                        always_set_input_rotation:   false,
+                        // Resolve supplies recorded pixels (fitted and rotated
+                        // into its buffer), not lens-profile desqueezed pixels.
+                        anamorphic_adjust_size:      false,
+                        fixed_output_size:           false,
+                        last_out_size:               (0, 0),
+                        pixel_focal_ratio:           1.0,
+                        // Resolve shows the timeline's part of the de-squeezed clip: stabilize to that
+                        crop_to_timeline_window:     true,
                         has_motion:                  false,
                         keyframable_params: Arc::new(RwLock::new(KeyframableParams {
                             use_gyroflows_keyframes: param_set.parameter::<Bool>("UseGyroflowsKeyframes")?.get_value()?,
@@ -502,6 +540,8 @@ impl Execute for GyroflowPlugin {
                 let props: EffectInstance = effect.properties()?;
                 if matches!(props.get_resolve_page().as_deref(), Ok("Edit") | Ok("Color")) {
                     instance_data.supports_output_size = false;
+                    // The output buffer is the timeline
+                    instance_data.plugin.fixed_output_size = true;
                 }
                 if matches!(props.get_resolve_page().as_deref(), Ok("Fusion")) {
                     instance_data.is_fusion_page = true;
@@ -695,9 +735,9 @@ impl Execute for GyroflowPlugin {
                 let mut effect_properties: EffectDescriptor = effect.properties()?;
                 effect_properties.set_grouping("Warp")?;
 
-                effect_properties.set_label("Gyroflow")?;
-                effect_properties.set_short_label("Gyroflow")?;
-                effect_properties.set_long_label("Gyroflow")?;
+                effect_properties.set_label("Gyroflow (Omni)")?;
+                effect_properties.set_short_label("Gyroflow (Omni)")?;
+                effect_properties.set_long_label(PLUGIN_LABEL)?;
 
                 effect_properties.set_supported_pixel_depths(&[BitDepth::Byte, BitDepth::Short, BitDepth::Float])?;
                 effect_properties.set_supported_contexts(&[ImageEffectContext::Filter])?;
