@@ -4,11 +4,48 @@ use std::sync::atomic::Ordering::SeqCst;
 use ofx::*;
 use super::fuscript::*;
 use gyroflow_plugin_base::*;
+use gyroflow_plugin_base::inspector_language;
+use gyroflow_core::stabilization_params::StabilizationParams;
 use gyroflow_plugin_base::parking_lot::{ Mutex, RwLock };
 use gyroflow_plugin_base::lru::LruCache;
 
+const PLUGIN_LABEL: &str = concat!("Gyroflow (Omni) ", env!("CARGO_PKG_VERSION"));
+const SOURCE_MEDIA_PATH: &str = "SourceMediaPath";
+const WEBSITE_PARAM: &str = "OpenWebsite";
+const WEBSITE_DOMAIN: &str = "www.omnicinecontrol.com";
+
+fn open_website() {
+    use std::process::Command;
+
+    let url = format!("https://{WEBSITE_DOMAIN}");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("cmd.exe");
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        command.args(["/d", "/c", "start", "", &url]);
+        command
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut command = {
+        let mut command = Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" });
+        command.arg(url);
+        command
+    };
+
+    if let Err(err) = std::thread::Builder::new().spawn(move || {
+        match command.status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => log::error!("Website launcher exited with {status}"),
+            Err(err) => log::error!("Could not launch the website: {err}"),
+        }
+    }) {
+        log::error!("Could not start the website launcher: {err}");
+    }
+}
+
 plugin_module!(
-    "xyz.gyroflow",
+    "xyz.gyroflow.omni",
     ApiVersion(1),
     PluginVersion(1, 2),
     GyroflowPlugin::default
@@ -27,6 +64,73 @@ pub fn frame_from_timetype(time: TimeType) -> f64 {
     }
 }
 
+/// Parameters defined outside `GyroflowPluginBase::get_param_definitions`: (name, label, hint)
+const LANGUAGE_PARAM: (&str, &str, &str) = ("Language", "Language", "Choose the Inspector language. Use default follows DaVinci Resolve's language; Save as default keeps the chosen language for new instances.");
+const LENS_PROFILE_LIST: (&str, &str, &str) = ("LensProfileList", "Lens profile library", "Load a lens profile or preset from the Gyroflow lens_profiles folder. The list is read when DaVinci Resolve starts.");
+const LENS_PROFILE_LIST_PROMPT: &str = "Select a lens profile…";
+/// The options of the lens profile list: a prompt, then the files of the library
+fn lens_profile_options() -> Vec<&'static str> {
+    std::iter::once(LENS_PROFILE_LIST_PROMPT).chain(lens_profile_library().iter().map(|(name, _)| name.as_str())).collect()
+}
+const DISTORTION_AWARE_BORDER: (&str, &str, &str) = ("DistortionAwareBorder", "Distortion-Aware Border", "Use the lens distortion model for the stabilization border. RS Compen. Only always uses rectangular geometry.");
+const ROLLING_SHUTTER_GROUP: (&str, &str, &str) = ("RollingShutterGroup", "Rolling Shutter", "");
+const ROLLING_SHUTTER_TOGGLES: [(&str, &str, &str); 2] = [
+    ("RollingShutterCompensationOnly", "RS Compen. Only", "Apply only rolling shutter compensation with rectangular border geometry. Requires RS Compen. On."),
+    ("RollingShutterCompensation", "RS Compen. On", "Correct rolling shutter using the sensor readout time."),
+];
+const ROLLING_SHUTTER_READOUT: (&str, &str, &str) = ("RollingShutterReadout", "Rolling shutter (ms)", "Sensor readout time in milliseconds, initialized from the loaded profile or clip.");
+const LENS_INFO_PARAMS: [(&str, &str, &str); 5] = [
+    ("LensCamera", "Camera", ""),
+    ("LensCameraSetting", "Camera setting", ""),
+    ("LensFocalLength", "Focal length", ""),
+    ("LensHorizontalSqueeze", "Horizontal squeeze", ""),
+    ("LensVerticalSqueeze", "Vertical squeeze", ""),
+];
+
+/// Whether the parameters were last described in Chinese
+static DESCRIBED_CHINESE: AtomicBool = AtomicBool::new(false);
+fn described_language() -> InspectorLanguage {
+    if DESCRIBED_CHINESE.load(SeqCst) { InspectorLanguage::Chinese } else { InspectorLanguage::English }
+}
+
+/// Relabels an instance's parameters, choice options included, in `lang`
+fn relabel_params(param_set: &ParamSetHandle, lang: InspectorLanguage) {
+    fn relabel(param_set: &ParamSetHandle, id: &str, label: &str, hint: &str, options: &[&str], lang: InspectorLanguage) {
+        let Ok(mut param) = param_set.parameter::<String>(id) else { return; };
+        let _ = param.set_label(lang.text(label));
+        if !hint.is_empty() {
+            let _ = param.set_hint(lang.text(hint));
+        }
+        for (i, option) in options.iter().enumerate() {
+            let _ = <str as RawSetter<_>>::set_at(&mut param, c"OfxParamPropChoiceOption".as_ptr(), i, lang.text(option));
+        }
+    }
+    fn walk(param_set: &ParamSetHandle, x: &ParameterType, lang: InspectorLanguage) {
+        match x {
+            ParameterType::HiddenString { .. } => {}
+            ParameterType::TextBox { id, label, hint } | ParameterType::Text { id, label, hint } |
+            ParameterType::Slider { id, label, hint, .. } | ParameterType::Checkbox { id, label, hint, .. } |
+            ParameterType::Button { id, label, hint } => relabel(param_set, id, label, hint, &[], lang),
+            ParameterType::Select { id, label, hint, options, .. } => relabel(param_set, id, label, hint, options, lang),
+            ParameterType::Group { id, label, parameters, .. } => {
+                relabel(param_set, id, label, "", &[], lang);
+                for x in parameters { walk(param_set, x, lang); }
+            }
+        }
+    }
+    for x in GyroflowPluginBase::get_param_definitions() {
+        walk(param_set, &x, lang);
+    }
+    let (id, label, hint) = LANGUAGE_PARAM;
+    relabel(param_set, id, label, hint, &inspector_language::CHOICES, lang);
+    let (id, label, hint) = LENS_PROFILE_LIST;
+    relabel(param_set, id, label, hint, &[LENS_PROFILE_LIST_PROMPT], lang);
+    for (id, label, hint) in [DISTORTION_AWARE_BORDER, ROLLING_SHUTTER_GROUP, ROLLING_SHUTTER_READOUT].into_iter()
+        .chain(ROLLING_SHUTTER_TOGGLES).chain(LENS_INFO_PARAMS) {
+        relabel(param_set, id, label, hint, &[], lang);
+    }
+}
+
 define_params!(ParamHandler {
     strings: [
         Status              => status:           ParamHandle<String>,
@@ -34,6 +138,8 @@ define_params!(ParamHandler {
         ProjectData         => project_data:     ParamHandle<String>,
         EmbeddedLensProfile => embedded_lens:    ParamHandle<String>,
         EmbeddedPreset      => embedded_preset:  ParamHandle<String>,
+        SqueezeBorder       => squeeze_border:   ParamHandle<String>,
+        VerticalStretchControlVersion => vertical_stretch_control_version: ParamHandle<String>,
         ProjectPath         => project_path:     ParamHandle<String>,
         OpenGyroflow        => open_in_gyroflow: ParamHandle<String>,
         ReloadProject       => reload_project:   ParamHandle<String>,
@@ -42,13 +148,22 @@ define_params!(ParamHandler {
         LoadedProject       => loaded_project:   ParamHandle<String>,
         LoadedPreset        => loaded_preset:    ParamHandle<String>,
         LoadedLens          => loaded_lens:      ParamHandle<String>,
+        LensCamera          => lens_camera:     ParamHandle<String>,
+        LensCameraSetting   => lens_camera_setting: ParamHandle<String>,
+        LensFocalLength     => lens_focal_length: ParamHandle<String>,
+        LensHorizontalSqueeze => lens_horizontal_squeeze: ParamHandle<String>,
+        LensVerticalSqueeze => lens_vertical_squeeze: ParamHandle<String>,
     ],
     bools: [
-        DisableStretch        => disable_stretch:         ParamHandle<bool>,
         ToggleOverview        => toggle_overview:         ParamHandle<bool>,
         DontDrawOutside       => dont_draw_outside:       ParamHandle<bool>,
         IncludeProjectData    => include_project_data:    ParamHandle<bool>,
         UseGyroflowsKeyframes => use_gyroflows_keyframes: ParamHandle<bool>,
+        RollingShutterCompensation => rolling_shutter_compensation: ParamHandle<bool>,
+        RollingShutterCompensationOnly => rolling_shutter_compensation_only: ParamHandle<bool>,
+        DistortionAwareBorder => distortion_aware_border: ParamHandle<bool>,
+        ManualLens            => manual_lens:             ParamHandle<bool>,
+        ManualDistortionAuto  => manual_distortion_auto:  ParamHandle<bool>,
     ],
     f64s: [
         InputRotation         => input_rotation:           ParamHandle<Double>,
@@ -56,6 +171,7 @@ define_params!(ParamHandler {
         Smoothness            => smoothness:               ParamHandle<Double>,
         ZoomLimit             => zoom_limit:               ParamHandle<Double>,
         LensCorrectionStrength=> lens_correction_strength: ParamHandle<Double>,
+        RollingShutterReadout => rolling_shutter_readout: ParamHandle<Double>,
         HorizonLockAmount     => horizon_lock_amount:      ParamHandle<Double>,
         HorizonLockRoll       => horizon_lock_roll:        ParamHandle<Double>,
         // PositionX             => positionx:                ParamHandle<Double>,
@@ -66,11 +182,21 @@ define_params!(ParamHandler {
         VideoSpeed            => video_speed:              ParamHandle<Double>,
         OutputWidth           => output_width:             ParamHandle<Double>,
         OutputHeight          => output_height:            ParamHandle<Double>,
+        CustomSqueezeRatio    => custom_squeeze_ratio:     ParamHandle<Double>,
+        InputVerticalStretch  => input_vertical_stretch:   ParamHandle<Double>,
+        ManualFocalLength     => manual_focal_length:      ParamHandle<Double>,
+        ManualSensorWidth     => manual_sensor_width:      ParamHandle<Double>,
+        ManualDistortion      => manual_distortion:        ParamHandle<Double>,
         //FusionStartFrame      => fusion_start_frame:       ParamHandle<Double>,
     ],
     i32s: [
+        Zooming               => zooming:                  ParamHandle<Int>,
         Interpolation         => interpolation:            ParamHandle<Int>,
         IntegrationMethod     => integration_method:       ParamHandle<Int>,
+        SqueezeRatio          => squeeze_ratio:            ParamHandle<Int>,
+        VerticalSqueezeRatio  => vertical_squeeze_ratio:   ParamHandle<Int>,
+        Language              => language:                 ParamHandle<Int>,
+        LensProfileList       => lens_profile_list:        ParamHandle<Int>,
     ],
 
     get_string:  _s p    { Ok(p.get_value()?) },
@@ -112,13 +238,173 @@ struct InstanceData {
     supports_output_size: bool,
     is_fusion_page: bool,
     file_path: Option<String>,
+    source_media_path: ParamHandle<String>,
+    uncropped_renderer: Option<StabilizationManager>,
+    rolling_shutter_renderer: Option<(Arc<StabilizationManager>, StabilizationManager)>,
 
     current_file_info_pending: Arc<AtomicBool>,
     current_file_info: Arc<Mutex<Option<CurrentFileInfo>>>,
 }
 
+fn uncropped_source_renderer(cache: &mut Option<StabilizationManager>, size: (usize, usize)) -> &StabilizationManager {
+    let renderer = cache.get_or_insert_with(|| {
+        let stab = StabilizationManager::default();
+        let mut engine = stab.stabilization.write();
+        engine.share_wgpu_instances = true;
+        engine.interpolation = Interpolation::Bilinear;
+        drop(engine);
+        stab
+    });
+    if renderer.params.read().size != size {
+        renderer.init_from_video_data(1000.0, 1.0, 1, size);
+        renderer.set_size(size.0, size.1);
+        renderer.set_output_size(size.0, size.1);
+        renderer.recompute_undistortion();
+    }
+    renderer
+}
+
+fn rolling_shutter_only_renderer<'a>(
+    cache: &'a mut Option<(Arc<StabilizationManager>, StabilizationManager)>,
+    source: &Arc<StabilizationManager>,
+    input_rotation: f64,
+) -> &'a StabilizationManager {
+    let params = source.params.read();
+    let gyro = source.gyro.read();
+    let reusable = cache.as_ref().is_some_and(|(parent, renderer)| {
+        let configured = renderer.params.read();
+        Arc::ptr_eq(parent, source)
+            && Arc::ptr_eq(&renderer.gyro.read().quaternions, &gyro.quaternions)
+            && configured.frame_readout_time == params.frame_readout_time
+            && configured.frame_readout_direction as i32 == params.frame_readout_direction as i32
+            && configured.video_rotation == input_rotation
+    });
+    if !reusable {
+        let mut motion = gyro.clone();
+        drop(gyro);
+        // Identity smoothing correction leaves the row-to-frame-centre rotation intact.
+        motion.smoothed_quaternions = Arc::default();
+        {
+            let original = motion.file_metadata.read();
+            let mut timing = original.thin();
+            timing.per_frame_time_offsets = original.per_frame_time_offsets.clone();
+            timing.lens_params = original.lens_params.clone();
+            timing.digital_zoom = None;
+            drop(original);
+            motion.file_metadata = timing.into();
+        }
+        let mut settings = StabilizationParams {
+            size: params.size,
+            fps: params.fps,
+            fps_scale: params.fps_scale,
+            duration_ms: params.duration_ms,
+            frame_count: params.frame_count,
+            frame_times: params.frame_times.clone(),
+            frame_offset: params.frame_offset,
+            frame_readout_time: params.frame_readout_time,
+            frame_readout_direction: params.frame_readout_direction,
+            framebuffer_inverted: params.framebuffer_inverted,
+            video_rotation: input_rotation,
+            adaptive_zoom_window: 0.0,
+            max_zoom: None,
+            lens_correction_amount: 0.0,
+            lens_breathing_enabled: false,
+            ..Default::default()
+        };
+        drop(params);
+        let (camera, ..) = FrameTransform::get_lens_data_at_timestamp(&ComputeParams::from_manager(source), 0.0, false);
+        let (width, height) = GyroflowPluginBase::rotated_size(settings.size, input_rotation);
+        settings.output_size = if GyroflowPluginBase::is_quarter_turn(input_rotation) {
+            let focal_ratio = camera[(0, 0)] / camera[(1, 1)];
+            ((width as f64 * focal_ratio.powi(2)).round().max(1.0) as usize, height)
+        } else {
+            (width, height)
+        };
+        let size = settings.size;
+        let renderer = StabilizationManager::default();
+        *renderer.params.write() = settings;
+        *renderer.gyro.write() = motion;
+        {
+            let mut lens = renderer.lens.write();
+            lens.calib_dimension.w = size.0 as _;
+            lens.calib_dimension.h = size.1 as _;
+            lens.fisheye_params.camera_matrix = (0..3).map(|row| [
+                camera[(row, 0)], camera[(row, 1)], camera[(row, 2)],
+            ]).collect();
+            // Pinhole projection keeps the nominal image boundary rectangular.
+            lens.fisheye_params.distortion_coeffs = vec![0.0; 4];
+        }
+        {
+            let mut engine = renderer.stabilization.write();
+            engine.share_wgpu_instances = true;
+            engine.interpolation = source.stabilization.read().interpolation;
+        }
+        renderer.init_size();
+        renderer.recompute_undistortion();
+        *cache = Some((source.clone(), renderer));
+    }
+    &cache.as_ref().expect("rolling shutter renderer initialized").1
+}
+
+#[test]
+fn rolling_shutter_only_preserves_frame_centre_motion() {
+    use gyroflow_core::gyro_source::Quat64;
+
+    let source = Arc::new(StabilizationManager::default());
+    let size = (32, 24, 32 * 4);
+    source.init_from_video_data(1000.0, 25.0, 25, (size.0, size.1));
+    source.set_output_size(size.0, size.1);
+    source.set_frame_readout_time(20.0);
+    source.set_fov(0.5);
+    source.lens.write().fisheye_params.distortion_coeffs = vec![0.2; 4];
+    {
+        let mut gyro = source.gyro.write();
+        gyro.duration_ms = 1000.0;
+        gyro.quaternions = Arc::new([
+            (0, Quat64::identity()),
+            (1_000_000, Quat64::from_euler_angles(0.0, 1.0, 0.0)),
+        ].into());
+        gyro.smoothed_quaternions = Arc::new([
+            (0, Quat64::from_euler_angles(0.0, 0.5, 0.0)),
+            (1_000_000, Quat64::from_euler_angles(0.0, 0.5, 0.0)),
+        ].into());
+    }
+
+    let mut cache = None;
+    let renderer = rolling_shutter_only_renderer(&mut cache, &source, 0.0);
+    let mut input = vec![255; size.1 * size.2];
+    let mut output = vec![0; input.len()];
+    let buffers = Buffers {
+        input: BufferDescription { size, data: BufferSource::Cpu { buffer: &mut input }, ..Default::default() },
+        output: BufferDescription { size, data: BufferSource::Cpu { buffer: &mut output }, ..Default::default() },
+    };
+    let transform = renderer.stabilization.read().get_frame_transform_at::<RGBA8>(400_000, None, &buffers);
+    assert_eq!(transform.matrices.len(), size.1);
+    let centre = &transform.matrices[size.1 / 2][..9];
+    assert!(centre.iter().zip([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]).all(|(a, b)| (*a - b).abs() < 1e-6));
+    assert_ne!(transform.matrices.first(), transform.matrices.last());
+    assert_eq!(transform.kernel_params.fov, 1.0);
+    assert_eq!(renderer.lens.read().fisheye_params.distortion_coeffs, vec![0.0; 4]);
+    assert_eq!(source.lens.read().fisheye_params.distortion_coeffs, vec![0.2; 4]);
+}
+
+#[test]
+fn uncropped_source_renderer_preserves_edges_and_corners() {
+    let size = (24, 16, 24 * 4);
+    let mut cache = None;
+    let renderer = uncropped_source_renderer(&mut cache, (size.0, size.1));
+    renderer.stabilization.write().set_device(-1);
+    let mut input: Vec<u8> = (0..size.1 * size.2).map(|i| (i % 251) as u8).collect();
+    let mut output = vec![0; input.len()];
+    renderer.process_pixels::<RGBA8>(0, None, &mut Buffers {
+        input: BufferDescription { size, data: BufferSource::Cpu { buffer: &mut input }, ..Default::default() },
+        output: BufferDescription { size, data: BufferSource::Cpu { buffer: &mut output }, ..Default::default() },
+    }).unwrap();
+    assert_eq!(output, input);
+}
+
 impl InstanceData {
-    fn stab_manager(&mut self, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, output_rect: RectI, loading_pending_video_file: bool) -> Result<Arc<StabilizationManager>> {
+    fn stab_manager(&mut self, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, output_rect: RectI, thumbnail: bool, loading_pending_video_file: bool) -> Result<Arc<StabilizationManager>> {
         /*let source_rect = self.source_clip.get_region_of_definition(0.0)?;
         let mut source_rect = RectI {
             x1: source_rect.x1 as i32,
@@ -130,25 +416,73 @@ impl InstanceData {
             source_rect = self.source_clip.get_image(0.0)?.get_bounds()?;
         }
         let in_size = ((source_rect.x2 - source_rect.x1) as usize, (source_rect.y2 - source_rect.y1) as usize);*/
-        let out_size = ((output_rect.x2 - output_rect.x1) as usize, (output_rect.y2 - output_rect.y1) as usize);
+        let mut out_size = ((output_rect.x2 - output_rect.x1) as usize, (output_rect.y2 - output_rect.y1) as usize);
+        if self.plugin.fixed_output_size {
+            if thumbnail || out_size.0.max(out_size.1) < 320 {
+                if self.plugin.last_out_size != (0, 0) {
+                    out_size = self.plugin.last_out_size;
+                }
+            } else if out_size.0 > 0 && out_size.1 > 0 && self.plugin.timeline_size != out_size {
+                self.plugin.update_timeline_size(&self.params, manager_cache, out_size);
+            }
+        }
 
         self.plugin.stab_manager(&mut self.params, manager_cache, out_size, loading_pending_video_file).map_err(|e| {
             log::error!("plugin.stab_manager error: {e:?}");
             Error::UnknownError
         })
     }
-    pub fn check_pending_file_info(&mut self) -> Result<bool> { // -> is_video_file
+    fn load_source_project(
+        &mut self,
+        manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>,
+        source_path: &str,
+        project_path: &str,
+        automatic: bool,
+    ) -> Result<()> {
+        let previous_project = self.params.project_path.get_value()?;
+        let previous_source = self.source_media_path.get_value()?;
+        let same_project = GyroflowPluginBase::same_file(&previous_project, project_path);
+        let same_source = if previous_source.is_empty() {
+            // Older effects only saved the project path. Its sidecar may now exist only as embedded data.
+            let sidecar = std::path::Path::new(source_path).with_extension("gyroflow");
+            same_project
+                || GyroflowPluginBase::same_file(&previous_project, source_path)
+                || GyroflowPluginBase::same_file(&previous_project, &sidecar.to_string_lossy())
+        } else {
+            GyroflowPluginBase::same_file(&previous_source, source_path)
+        };
+        let source_changed = !previous_project.is_empty() && !same_source;
+
+        // An automatic restore of the same media keeps its selected project and embedded data.
+        if !automatic || previous_project.is_empty() || source_changed {
+            if source_changed || !same_project {
+                self.params.project_data.set_value(String::new())?;
+            }
+            if source_changed {
+                // The paste carries Resolve's curves. The destination project's internal curves
+                // would take precedence over them if left enabled.
+                self.params.use_gyroflows_keyframes.set_value(false)?;
+            }
+            self.params.rolling_shutter_readout.set_value(UNSET_ROLLING_SHUTTER_READOUT)?;
+            self.params.project_path.set_value(project_path.to_owned())?;
+            self.plugin.keep_adjustments = source_changed;
+            self.plugin.reload_values_from_project = true;
+            self.plugin.clear_stab(manager_cache);
+        }
+        if !GyroflowPluginBase::same_file(&previous_source, source_path) {
+            self.source_media_path.set_value(source_path.to_owned())?;
+        }
+        Ok(())
+    }
+
+    fn check_pending_file_info(&mut self, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>) -> Result<bool> {
         if self.current_file_info_pending.load(SeqCst) {
             self.current_file_info_pending.store(false, SeqCst);
-            let lock = self.current_file_info.lock();
-            if let Some(ref current_file) = *lock {
-                if let Some(proj) = &current_file.project_path {
-                    self.params.set_string(Params::ProjectPath, &proj).unwrap(); // TODO: unwrap
-                } else {
-                    // Try to use the video directly
-                    self.params.set_string(Params::ProjectPath, &current_file.file_path).unwrap(); // TODO: unwrap
-                    return Ok(true);
-                }
+            let source = self.current_file_info.lock().as_ref()
+                .map(|file| (file.file_path.clone(), file.project_path.clone()));
+            if let Some((source_path, project_path)) = source {
+                self.load_source_project(manager_cache, &source_path, project_path.as_deref().unwrap_or(&source_path), false)?;
+                return Ok(project_path.is_none());
             }
         }
         Ok(false)
@@ -165,17 +499,16 @@ impl Execute for GyroflowPlugin {
                 let _time = std::time::Instant::now();
 
                 let time = in_args.get_time()?;
+                let host_time = time;
                 let instance_data: &mut InstanceData = effect.get_instance_data()?;
+                let rolling_shutter_only = instance_data.params.get_bool(Params::RollingShutterCompensationOnly).unwrap_or_default();
 
                 if let Some(path) = instance_data.file_path.take() {
-                    let project_path = instance_data.params.get_string(Params::ProjectPath).unwrap_or_default();
-                    let new_project_path = gyroflow_plugin_base::GyroflowPluginBase::get_project_path(&path).unwrap_or(path);
-                    if project_path.is_empty() || project_path != new_project_path {
-                        let _ = instance_data.params.set_string(Params::ProjectPath, &new_project_path);
-                    }
+                    let project_path = GyroflowPluginBase::get_project_path(&path);
+                    instance_data.load_source_project(&self.gyroflow_plugin.manager_cache, &path, project_path.as_deref().unwrap_or(&path), true)?;
                 }
 
-                let loading_pending_video_file = instance_data.check_pending_file_info()?;
+                let loading_pending_video_file = instance_data.check_pending_file_info(&self.gyroflow_plugin.manager_cache)?;
 
                 let output_image = if in_args.get_opengl_enabled().unwrap_or_default() {
                     instance_data.output_clip.load_texture_mut(time, None)?
@@ -186,7 +519,9 @@ impl Execute for GyroflowPlugin {
 
                 let output_rect: RectI = output_image.get_region_of_definition()?;
 
-                let stab = instance_data.stab_manager(&self.gyroflow_plugin.manager_cache, output_rect, loading_pending_video_file)?;
+                let thumbnail = instance_data.plugin.fixed_output_size
+                    && <Bool as RawGetter<_>>::get_at(in_args, c"OfxImageEffectPropThumbnailRender".as_ptr(), 0).unwrap_or_default();
+                let stab = instance_data.stab_manager(&self.gyroflow_plugin.manager_cache, output_rect, thumbnail, loading_pending_video_file)?;
 
                 if !instance_data.supports_output_size {
                     let _ = instance_data.params.output_width.set_enabled(false);
@@ -201,11 +536,11 @@ impl Execute for GyroflowPlugin {
                 let params = stab.params.read();
                 let fps = params.fps;
                 let src_fps = instance_data.source_clip.get_frame_rate().unwrap_or(fps);
-                let org_ratio = params.size.0 as f64 / params.size.1 as f64;
-                let (has_accurate_timestamps, has_offsets) = {
+                let video_size = params.size;
+                let (has_accurate_timestamps, has_offsets, has_gyro) = {
                     let gyro = stab.gyro.read();
                     let md = gyro.file_metadata.read();
-                    (md.has_accurate_timestamps, !gyro.get_offsets().is_empty())
+                    (md.has_accurate_timestamps, !gyro.get_offsets().is_empty(), !gyro.quaternions.is_empty())
                 };
 
                 let mut speed_stretch = 1.0;
@@ -225,8 +560,15 @@ impl Execute for GyroflowPlugin {
                     speed_stretch = 1.0;
                 }
 
-                if (src_fps - fps).abs() > 0.01 {
-                    instance_data.plugin.set_status(&mut instance_data.params, "Timeline fps mismatch!", "Timeline frame rate doesn't match the clip frame rate! Use the plugin in Fusion instead", false);
+                // The host may tell which source frame it renders (Resolve does, retimed and conformed clips included): the
+                // timestamps are exact then, whatever the frame rates
+                let src_frame = in_args.get_src_frame().ok();
+
+                if !has_gyro {
+                    instance_data.plugin.set_status(&mut instance_data.params, "No gyro data in this file", "This file has no motion data (a transcode or an export of the original, or a camera without gyro). Use the original camera file, or open it in Gyroflow to load the motion data from another file.", false);
+                } else if (src_fps - fps).abs() > 0.01 && src_frame.is_none() {
+                    let status = format!("Timeline fps mismatch! ({fps:.3} clip, {src_fps:.3} timeline)");
+                    instance_data.plugin.set_status(&mut instance_data.params, &status, "Timeline frame rate doesn't match the clip frame rate! Use the plugin in Fusion instead", false);
                 } else if !has_accurate_timestamps && !has_offsets {
                     instance_data.plugin.set_status(&mut instance_data.params, "Not synced. Open in Gyroflow", "Gyro data is not synced with the video, open the video in Gyroflow and add sync points (eg. by doing autosync)", false);
                 } else {
@@ -244,11 +586,12 @@ impl Execute for GyroflowPlugin {
                     let frame = (time / src_fps) * fps * speed_stretch;
                     timestamp_us = (frame.floor() * (1_000_000.0 / fps)).round() as i64;
                 }
-                if let Ok(frame) = in_args.get_src_frame() {
+                if let Some(frame) = src_frame {
                     timestamp_us = (frame as f64 * (1_000_000.0 / fps)).round() as i64;
                 }
 
-                let source_timestamp_us = params.get_source_timestamp_at_ramped_timestamp(timestamp_us);
+                let source_timestamp_us = if rolling_shutter_only { timestamp_us } else { params.get_source_timestamp_at_ramped_timestamp(timestamp_us) };
+                let rolling_shutter_inactive = params.frame_readout_time == 0.0 || !has_gyro;
                 drop(params);
 
                 if source_timestamp_us != timestamp_us {
@@ -261,6 +604,18 @@ impl Execute for GyroflowPlugin {
                 }
 
                 time += time_adj;
+                let uncropped = if rolling_shutter_only {
+                    rolling_shutter_inactive
+                } else if GyroflowPluginBaseInstance::distortion_aware_border(&instance_data.params) {
+                    false
+                } else if instance_data.params.get_bool(Params::UseGyroflowsKeyframes).unwrap_or_default()
+                    && stab.keyframes.read().is_keyframed_internally(&KeyframeType::SmoothingParamSmoothness)
+                {
+                    stab.keyframes.read().value_at_video_timestamp(&KeyframeType::SmoothingParamSmoothness, timestamp_us as f64 / 1000.0) == Some(0.0)
+                } else {
+                    matches!(instance_data.params.get_f64_at_time(Params::Smoothness, TimeType::Frame(host_time))
+                        .or_else(|_| instance_data.params.get_f64(Params::Smoothness)), Ok(0.0))
+                };
                 let source_image = if in_args.get_opengl_enabled().unwrap_or_default() {
                     instance_data.source_clip.load_texture(time, None)?
                 } else {
@@ -277,37 +632,55 @@ impl Execute for GyroflowPlugin {
                 if src_size.2 <= 0 { src_size.2 = src_size.0 * 4 * 4 }; // assuming 32-bit float
                 if out_size.2 <= 0 { out_size.2 = out_size.0 * 4 * 4 }; // assuming 32-bit float
 
-                let src_rect = GyroflowPluginBase::get_center_rect(src_size.0, src_size.1, org_ratio);
-
-                let mut out_rect = if instance_data.params.get_bool_at_time(Params::DontDrawOutside, TimeType::Frame(time)).unwrap() { // TODO: unwrap
-                    let output_ratio = out_size.0 as f64 / out_size.1 as f64;
-                    let mut rect = GyroflowPluginBase::get_center_rect(src_rect.2, src_rect.3, output_ratio);
-                    rect.0 += src_rect.0;
-                    rect.1 += src_rect.1;
-                    Some(rect)
+                // The clip in the input buffer, turned by the input rotation, and where the stabilized image goes in the output
+                // (Vegas draws over the whole output buffer, see below)
+                let is_vegas = _plugin_context.get_host().get_name().as_deref().ok() == Some("com.vegascreativesoftware.vegas");
+                let input_rotation = instance_data.params.get_f64_at_time(Params::InputRotation, TimeType::Frame(time)).unwrap_or_default();
+                let keep_clip_frame = rolling_shutter_only || (!is_vegas && instance_data.plugin.keep_clip_frame(&instance_data.params, video_size, input_rotation, (out_size.0, out_size.1)));
+                let geometry = GyroflowPluginBase::render_geometry(video_size, input_rotation, (src_size.0, src_size.1), (out_size.0, out_size.1), instance_data.is_fusion_page, keep_clip_frame, true);
+                // The output size has the aspect of what it's drawn into
+                let output_size = if is_vegas {
+                    (instance_data.params.get_f64(Params::OutputWidth).unwrap_or_default() as usize, instance_data.params.get_f64(Params::OutputHeight).unwrap_or_default() as usize)
                 } else {
-                    None
+                    instance_data.plugin.output_size_for(&instance_data.params, video_size, geometry.input_rotation, (out_size.0, out_size.1))
                 };
+                if !rolling_shutter_only && !uncropped {
+                    GyroflowPluginBaseInstance::ensure_output_aspect(&stab, output_size);
+                }
+                let src_rect = if uncropped { None } else { Some(geometry.src_rect) };
+                // Of an anamorphic clip, only the part the timeline shows once de-squeezed (the output size has its aspect)
+                let mut out_rect = if uncropped {
+                    Some(GyroflowPluginBase::get_center_rect(out_size.0, out_size.1, src_size.0 as f64 / src_size.1.max(1) as f64))
+                } else if rolling_shutter_only || is_vegas {
+                    geometry.out_rect
+                } else {
+                    geometry.out_rect.map(|r| instance_data.plugin.timeline_window_rect(&instance_data.params, r))
+                };
+
                 let out_scale = output_image.get_render_scale()?;
                 if (out_scale.x != 1.0 || out_scale.y != 1.0) && !in_args.get_opengl_enabled().unwrap_or_default() {
                     // log::debug!("out_scale: {:?}", out_scale);
                     let w = (out_size.0 as f64 * out_scale.x as f64).round() as usize;
                     let h = (out_size.1 as f64 * out_scale.y as f64).round() as usize;
                     if out_size.1 > h {
+                        // The image is in the scaled part of the buffer, the rect it's drawn into scales with it
+                        let (rx, ry, rw, rh) = out_rect.unwrap_or((0, 0, out_size.0, out_size.1));
+                        let sx = w as f64 / out_size.0 as f64;
+                        let sy = h as f64 / out_size.1 as f64;
                         out_rect = Some((
-                            0,
-                            out_size.1 - h, // because the coordinates are inverted
-                            w,
-                            h
+                            (rx as f64 * sx).round() as usize,
+                            out_size.1 - h + (ry as f64 * sy).round() as usize, // because the coordinates are inverted
+                            (rw as f64 * sx).round() as usize,
+                            (rh as f64 * sy).round() as usize
                         ));
                     }
                 }
 
-                if _plugin_context.get_host().get_name().as_deref().ok() == Some("com.vegascreativesoftware.vegas") {
+                if is_vegas && !rolling_shutter_only && !uncropped {
                     out_rect = None;
                 }
 
-                let input_rotation = instance_data.params.get_f64_at_time(Params::InputRotation, TimeType::Frame(time)).ok().map(|x| x as f32);
+                let input_rotation = (!uncropped).then_some(geometry.kernel_rotation as f32);
 
                 // log::debug!("src_size: {src_size:?} | src_rect: {src_rect:?}");
                 // log::debug!("out_size: {out_size:?} | out_rect: {out_rect:?}");
@@ -391,16 +764,25 @@ impl Execute for GyroflowPlugin {
 
                 if let Some(buffers) = buffers {
                     let mut buffers = Buffers {
-                        input:  BufferDescription { size: src_size, rect: Some(src_rect), data: buffers.0, rotation: input_rotation, texture_copy: buffers.2 },
+                        input:  BufferDescription { size: src_size, rect: src_rect,       data: buffers.0, rotation: input_rotation, texture_copy: buffers.2 },
                         output: BufferDescription { size: out_size, rect: out_rect,       data: buffers.1, rotation: None,           texture_copy: buffers.2 }
+                    };
+                    let (renderer, timestamp_us) = if uncropped {
+                        // Resolve already positioned and rotated these source pixels. Fit the
+                        // whole host frame, without the stabilized window, FOV, or lens warp.
+                        (uncropped_source_renderer(&mut instance_data.uncropped_renderer, (src_size.0, src_size.1)), 0)
+                    } else if rolling_shutter_only {
+                        (rolling_shutter_only_renderer(&mut instance_data.rolling_shutter_renderer, &stab, geometry.input_rotation), timestamp_us)
+                    } else {
+                        (stab.as_ref(), timestamp_us)
                     };
 
                     let processed = match output_image.get_pixel_depth()? {
                         BitDepth::None  => { return FAILED; },
-                        BitDepth::Byte  => stab.process_pixels::<RGBA8>  (timestamp_us, None, &mut buffers),
-                        BitDepth::Short => stab.process_pixels::<RGBA16> (timestamp_us, None, &mut buffers),
-                        BitDepth::Half  => stab.process_pixels::<RGBAf16>(timestamp_us, None, &mut buffers),
-                        BitDepth::Float => stab.process_pixels::<RGBAf>  (timestamp_us, None, &mut buffers)
+                        BitDepth::Byte  => renderer.process_pixels::<RGBA8>  (timestamp_us, None, &mut buffers),
+                        BitDepth::Short => renderer.process_pixels::<RGBA16> (timestamp_us, None, &mut buffers),
+                        BitDepth::Half  => renderer.process_pixels::<RGBAf16>(timestamp_us, None, &mut buffers),
+                        BitDepth::Float => renderer.process_pixels::<RGBAf>  (timestamp_us, None, &mut buffers)
                     };
                     match processed {
                         Ok(_) => {
@@ -430,13 +812,17 @@ impl Execute for GyroflowPlugin {
                     supports_output_size: true,
                     is_fusion_page: false,
                     file_path: None,
+                    source_media_path: param_set.parameter(SOURCE_MEDIA_PATH)?,
+                    uncropped_renderer: None,
+                    rolling_shutter_renderer: None,
                     params: ParamHandler {
                         instance_id:              param_set.parameter("InstanceId")?,
                         project_data:             param_set.parameter("ProjectData")?,
                         embedded_lens:            param_set.parameter("EmbeddedLensProfile")?,
                         embedded_preset:          param_set.parameter("EmbeddedPreset")?,
+                        squeeze_border:           param_set.parameter("SqueezeBorder")?,
+                        vertical_stretch_control_version: param_set.parameter("VerticalStretchControlVersion")?,
                         project_path:             param_set.parameter("ProjectPath")?,
-                        disable_stretch:          param_set.parameter("DisableStretch")?,
                         status:                   param_set.parameter("Status")?,
                         open_in_gyroflow:         param_set.parameter("OpenGyroflow")?,
                         reload_project:           param_set.parameter("ReloadProject")?,
@@ -449,6 +835,15 @@ impl Execute for GyroflowPlugin {
                         smoothness:               param_set.parameter("Smoothness")?,
                         zoom_limit:               param_set.parameter("ZoomLimit")?,
                         lens_correction_strength: param_set.parameter("LensCorrectionStrength")?,
+                        rolling_shutter_compensation: param_set.parameter("RollingShutterCompensation")?,
+                        rolling_shutter_compensation_only: param_set.parameter("RollingShutterCompensationOnly")?,
+                        distortion_aware_border:   param_set.parameter("DistortionAwareBorder")?,
+                        manual_lens:               param_set.parameter("ManualLens")?,
+                        manual_focal_length:       param_set.parameter("ManualFocalLength")?,
+                        manual_sensor_width:       param_set.parameter("ManualSensorWidth")?,
+                        manual_distortion_auto:    param_set.parameter("ManualDistortionAuto")?,
+                        manual_distortion:         param_set.parameter("ManualDistortion")?,
+                        rolling_shutter_readout: param_set.parameter("RollingShutterReadout")?,
                         horizon_lock_amount:      param_set.parameter("HorizonLockAmount")?,
                         horizon_lock_roll:        param_set.parameter("HorizonLockRoll")?,
                         video_speed:              param_set.parameter("VideoSpeed")?,
@@ -463,10 +858,22 @@ impl Execute for GyroflowPlugin {
                         output_size_fit:          param_set.parameter("OutputSizeToTimeline")?,
                         interpolation:            param_set.parameter("Interpolation")?,
                         integration_method:       param_set.parameter("IntegrationMethod")?,
+                        zooming:                  param_set.parameter("Zooming")?,
+                        squeeze_ratio:            param_set.parameter("SqueezeRatio")?,
+                        custom_squeeze_ratio:     param_set.parameter("CustomSqueezeRatio")?,
+                        input_vertical_stretch:   param_set.parameter("InputVerticalStretch")?,
+                        vertical_squeeze_ratio:   param_set.parameter("VerticalSqueezeRatio")?,
+                        language:                 param_set.parameter("Language")?,
+                        lens_profile_list:        param_set.parameter("LensProfileList")?,
 
                         loaded_project:           param_set.parameter("LoadedProject")?,
                         loaded_lens:              param_set.parameter("LoadedLens")?,
                         loaded_preset:            param_set.parameter("LoadedPreset")?,
+                        lens_camera:              param_set.parameter("LensCamera")?,
+                        lens_camera_setting:      param_set.parameter("LensCameraSetting")?,
+                        lens_focal_length:        param_set.parameter("LensFocalLength")?,
+                        lens_horizontal_squeeze:  param_set.parameter("LensHorizontalSqueeze")?,
+                        lens_vertical_squeeze:    param_set.parameter("LensVerticalSqueeze")?,
 
                         //fusion_start_frame:       param_set.parameter("FusionStartFrame")?,
 
@@ -480,12 +887,20 @@ impl Execute for GyroflowPlugin {
                         num_frames:                  0,
                         fps:                         0.0,
                         reload_values_from_project:  false,
+                        keep_adjustments:            false,
+                        keep_input_adjustments:      true,
                         ever_changed:                false,
                         opencl_disabled:             false,
                         cache_keyframes_every_frame: true,
                         framebuffer_inverted:        true,
-                        anamorphic_adjust_size:      true,
-                        always_set_input_rotation:   false,
+                        // Resolve supplies recorded pixels (fitted and rotated
+                        // into its buffer), not lens-profile desqueezed pixels.
+                        anamorphic_adjust_size:      false,
+                        fixed_output_size:           false,
+                        last_out_size:               (0, 0),
+                        pixel_focal_ratio:           1.0,
+                        // Resolve shows the timeline's part of the de-squeezed clip: stabilize to that
+                        crop_to_timeline_window:     true,
                         has_motion:                  false,
                         keyframable_params: Arc::new(RwLock::new(KeyframableParams {
                             use_gyroflows_keyframes: param_set.parameter::<Bool>("UseGyroflowsKeyframes")?.get_value()?,
@@ -495,31 +910,61 @@ impl Execute for GyroflowPlugin {
                     current_file_info:         Arc::new(Mutex::new(None)),
                     current_file_info_pending: Arc::new(AtomicBool::new(false)),
                 };
+                let language = instance_data.params.language();
                 let mut instance_id = instance_data.params.get_string(Params::InstanceId).unwrap_or_default();
+                let needs_instance_id = instance_id.is_empty();
                 instance_data.plugin.initialize_instance_id(&mut instance_id);
-                let _ = instance_data.params.set_string(Params::InstanceId, &instance_id);
 
                 let props: EffectInstance = effect.properties()?;
                 if matches!(props.get_resolve_page().as_deref(), Ok("Edit") | Ok("Color")) {
                     instance_data.supports_output_size = false;
+                    // The output buffer is the timeline
+                    instance_data.plugin.fixed_output_size = true;
                 }
                 if matches!(props.get_resolve_page().as_deref(), Ok("Fusion")) {
                     instance_data.is_fusion_page = true;
                 }
                 if let Ok(path) = props.get_src_file_path() {
                     if !path.is_empty() {
-                        instance_data.file_path = Some(path.clone());
+                        instance_data.file_path = Some(crate::fuscript::replace_frame_count(&path));
                     }
                 }
 
                 effect.set_instance_data(instance_data)?;
 
+                // Resolve can call InstanceChanged synchronously during host parameter writes.
+                if needs_instance_id {
+                    let _ = param_set.parameter::<String>("InstanceId")?.set_value(instance_id);
+                }
+                if language != described_language() {
+                    relabel_params(&param_set, language);
+                }
+
                 OK
             }
             InstanceChanged(ref mut effect, ref mut in_args) => {
+                let props: EffectInstance = effect.properties()?;
+                if <VoidPtr as RawGetter<_>>::get_at(&props, c"OfxPropInstanceData".as_ptr(), 0)?.is_null() {
+                    return REPLY_DEFAULT;
+                }
+                if in_args.get_name()? == WEBSITE_PARAM {
+                    if in_args.get_change_reason()? == Change::UserEdited {
+                        open_website();
+                    }
+                    return OK;
+                }
+                let param_set = effect.parameter_set()?;
                 let instance_data: &mut InstanceData = effect.get_instance_data()?;
+                if in_args.get_name()? == "Language" {
+                    relabel_params(&param_set, instance_data.params.language());
+                }
                 if in_args.get_name()? == "LoadCurrent" {
                     CurrentFileInfo::query(instance_data.current_file_info.clone(), instance_data.current_file_info_pending.clone());
+                }
+                if in_args.get_name()? == SOURCE_MEDIA_PATH
+                    || (in_args.get_name()? == "ProjectPath" && in_args.get_change_reason()? == Change::PluginEdited)
+                {
+                    return OK;
                 }
                 if in_args.get_name()? == "Source" || in_args.get_name()? == "Output" || in_args.get_name()? == "ResolveUseAlphaForTrackCompositing" {
                     log::info!("InstanceChanged {:?} {:?}", in_args.get_name()?, in_args.get_change_reason()?);
@@ -547,6 +992,10 @@ impl Execute for GyroflowPlugin {
                 let time = in_args.get_time()?;
                 let instance_data = effect.get_instance_data::<InstanceData>()?;
                 let rod = instance_data.source_clip.get_region_of_definition(time)?;
+                if instance_data.params.get_bool(Params::RollingShutterCompensationOnly).unwrap_or_default() {
+                    out_args.set_effect_region_of_definition(rod)?;
+                    return OK;
+                }
                 let mut out_rod = rod;
                 if instance_data.plugin.original_output_size != (0, 0) && !instance_data.params.get_bool_at_time(Params::DontDrawOutside, TimeType::Frame(time)).unwrap() { // TODO: unwrap
                     out_rod.x2 = instance_data.plugin.original_output_size.0 as f64;
@@ -577,7 +1026,7 @@ impl Execute for GyroflowPlugin {
 
                 let mut param_set = effect.parameter_set()?;
 
-                fn define_param(param_set: &mut ParamSetHandle, x: ParameterType, group: Option<&'static str>) -> Result<Int> {
+                fn define_param(param_set: &mut ParamSetHandle, x: ParameterType, group: Option<&'static str>, lang: InspectorLanguage) -> Result<Int> {
                     match x {
                         ParameterType::HiddenString { id } => {
                             let mut param = param_set.param_define_string(id)?;
@@ -592,79 +1041,165 @@ impl Execute for GyroflowPlugin {
                             }
                             let mut param = param_set.param_define_button(id)?;
                             let _ = param.set_script_name(id);
-                            param.set_label(label)?;
-                            param.set_hint(hint)?;
+                            param.set_label(lang.text(label))?;
+                            param.set_hint(lang.text(hint))?;
                             if let Some(group) = group { param.set_parent(group)?; }
                         }
                         ParameterType::TextBox { id, label, hint } => {
                             let mut param = param_set.param_define_string(id)?;
                             let _ = param.set_script_name(id);
                             param.set_string_type(ParamStringType::SingleLine)?;
-                            param.set_label(label)?;
-                            param.set_hint(hint)?;
+                            param.set_label(lang.text(label))?;
+                            param.set_hint(lang.text(hint))?;
                             if let Some(group) = group { param.set_parent(group)?; }
                         }
                         ParameterType::Text { id, label, hint } => {
                             let mut param = param_set.param_define_string(id)?;
                             param.set_string_type(ParamStringType::SingleLine)?;
-                            param.set_label(label)?;
-                            param.set_hint(hint)?;
+                            param.set_label(lang.text(label))?;
+                            param.set_hint(lang.text(hint))?;
                             //param.set_enabled(false)?;
                             if let Some(group) = group { param.set_parent(group)?; }
                         }
                         ParameterType::Slider { id, label, hint, min, max, default } => {
                             let mut param = param_set.param_define_double(id)?;
                             param.set_default(default)?;
-                            param.set_display_min(min)?;
+                            param.set_display_min(if id == "Smoothness" { 0.0 } else { min })?;
                             param.set_display_max(max)?;
-                            param.set_label(label)?;
-                            param.set_hint(hint)?;
+                            param.set_label(lang.text(label))?;
+                            param.set_hint(lang.text(hint))?;
                             let _ = param.set_script_name(id);
                             if let Some(group) = group { param.set_parent(group)?; }
                         }
                         ParameterType::Checkbox { id, label, hint, default } => {
                             if id == "StabilizationSpeedRamp" { return OK; }
                             let mut param = param_set.param_define_boolean(id)?;
-                            param.set_label(label)?;
-                            param.set_hint(hint)?;
+                            param.set_label(lang.text(label))?;
+                            param.set_hint(lang.text(hint))?;
                             param.set_default(default)?;
                             let _ = param.set_script_name(id);
                             if let Some(group) = group { param.set_parent(group)?; }
                         }
                         ParameterType::Select { id, label, hint, options, default } => {
                             let mut param = param_set.param_define_choice(id)?;
-                            param.set_label(label)?;
-                            param.set_hint(hint)?;
+                            param.set_label(lang.text(label))?;
+                            param.set_hint(lang.text(hint))?;
                             param.set_default(options.iter().position(|x| *x == default).unwrap_or(0) as i32)?;
-                            param.set_choices(&options)?;
+                            param.set_choices(&options.iter().map(|x| lang.text(x)).collect::<Vec<_>>())?;
                             let _ = param.set_script_name(id);
                             if let Some(group) = group { param.set_parent(group)?; }
                         }
                         ParameterType::Group { id, label, parameters, opened } => {
                             let mut param = param_set.param_define_group(id)?;
-                            param.set_label(label)?;
+                            param.set_label(lang.text(label))?;
                             param.set_group_open(opened)?;
                             if let Some(group) = group { param.set_parent(group)?; }
 
+                            if id == "ProjectGroup" {
+                                let (name, label, hint) = LANGUAGE_PARAM;
+                                let mut language = param_set.param_define_choice(name)?;
+                                language.set_parent(id)?;
+                                language.set_label(lang.text(label))?;
+                                language.set_hint(lang.text(hint))?;
+                                language.set_choices(&inspector_language::CHOICES.iter().map(|x| lang.text(x)).collect::<Vec<_>>())?;
+                                language.set_default(0)?;
+                                let _ = language.set_script_name(name);
+                                <Bool as RawSetter<_>>::set_at(&mut language, c"OfxParamPropAnimates".as_ptr(), 0, &false)?;
+                            }
                             for x in parameters {
-                                define_param(param_set, x, Some(id))?;
+                                let follows_video_speed = id == "AdjustGroup"
+                                    && matches!(&x, ParameterType::Slider { id: "VideoSpeed", .. });
+                                let follows_load_lens = matches!(&x, ParameterType::Button { id: "LoadLens", .. });
+                                define_param(param_set, x, Some(id), lang)?;
+                                if follows_load_lens {
+                                    let (name, label, hint) = LENS_PROFILE_LIST;
+                                    let mut list = param_set.param_define_choice(name)?;
+                                    list.set_parent(id)?;
+                                    list.set_label(lang.text(label))?;
+                                    list.set_hint(lang.text(hint))?;
+                                    list.set_choices(&lens_profile_options().into_iter().map(|x| lang.text(x)).collect::<Vec<_>>())?;
+                                    list.set_default(0)?;
+                                    let _ = list.set_script_name(name);
+                                    <Bool as RawSetter<_>>::set_at(&mut list, c"OfxParamPropAnimates".as_ptr(), 0, &false)?;
+                                }
+                                if follows_video_speed {
+                                    let mut border = param_set.param_define_boolean("DistortionAwareBorder")?;
+                                    border.set_parent(id)?;
+                                    border.set_label(lang.text(DISTORTION_AWARE_BORDER.1))?;
+                                    border.set_hint(lang.text(DISTORTION_AWARE_BORDER.2))?;
+                                    border.set_default(true)?;
+                                    let _ = border.set_script_name("DistortionAwareBorder");
+                                    <Bool as RawSetter<_>>::set_at(&mut border, c"OfxParamPropAnimates".as_ptr(), 0, &false)?;
+                                }
+                            }
+                            if id == "InfoGroup" {
+                                for (name, label, _) in LENS_INFO_PARAMS {
+                                    let mut field = param_set.param_define_string(name)?;
+                                    field.set_parent(id)?;
+                                    field.set_label(lang.text(label))?;
+                                    field.set_string_type(ParamStringType::SingleLine)?;
+                                    field.set_enabled(false)?;
+                                    let _ = <Bool as RawSetter<_>>::set_at(&mut field, c"OfxParamPropPluginMayWrite".as_ptr(), 0, &true);
+                                }
                             }
                         }
                     }
                     OK
                 }
 
-                for param in GyroflowPluginBase::get_param_definitions() {
-                    define_param(&mut param_set, param, None)?;
+                fn define_rolling_shutter(param_set: &mut ParamSetHandle, lang: InspectorLanguage) -> Result<()> {
+                    let group = "RollingShutterGroup";
+                    let mut rolling_shutter = param_set.param_define_group(group)?;
+                    rolling_shutter.set_label(lang.text(ROLLING_SHUTTER_GROUP.1))?;
+                    rolling_shutter.set_group_open(false)?;
+                    for ((id, label, hint), default) in ROLLING_SHUTTER_TOGGLES.into_iter().zip([false, true]) {
+                        let mut toggle = param_set.param_define_boolean(id)?;
+                        toggle.set_parent(group)?;
+                        toggle.set_label(lang.text(label))?;
+                        toggle.set_hint(lang.text(hint))?;
+                        let _ = toggle.set_script_name(id);
+                        toggle.set_default(default)?;
+                        <Bool as RawSetter<_>>::set_at(&mut toggle, c"OfxParamPropAnimates".as_ptr(), 0, &false)?;
+                    }
+                    let mut readout = param_set.param_define_double("RollingShutterReadout")?;
+                    readout.set_parent(group)?;
+                    readout.set_label(lang.text(ROLLING_SHUTTER_READOUT.1))?;
+                    let _ = readout.set_script_name("RollingShutterReadout");
+                    readout.set_hint(lang.text(ROLLING_SHUTTER_READOUT.2))?;
+                    readout.set_default(UNSET_ROLLING_SHUTTER_READOUT)?;
+                    readout.set_display_min(0.0)?;
+                    readout.set_display_max(50.0)?;
+                    <Bool as RawSetter<_>>::set_at(&mut readout, c"OfxParamPropAnimates".as_ptr(), 0, &false)?;
+                    let _ = <Bool as RawSetter<_>>::set_at(&mut readout, c"OfxParamPropPluginMayWrite".as_ptr(), 0, &true);
+                    Ok(())
                 }
+
+                // New instances open in the saved default language; one set to another relabels itself
+                let lang = InspectorLanguage::resolve(0);
+                DESCRIBED_CHINESE.store(lang == InspectorLanguage::Chinese, SeqCst);
+                for param in GyroflowPluginBase::get_param_definitions() {
+                    if matches!(&param, ParameterType::Group { id: "AdjustGroup", .. }) {
+                        define_rolling_shutter(&mut param_set, lang)?;
+                    }
+                    define_param(&mut param_set, param, None, lang)?;
+                }
+                define_param(&mut param_set, ParameterType::HiddenString { id: SOURCE_MEDIA_PATH }, None, lang)?;
+
+                define_param(&mut param_set, ParameterType::Button {
+                    id: WEBSITE_PARAM,
+                    label: WEBSITE_DOMAIN,
+                    hint: "Open the Omni Cine Control website",
+                }, None, lang)?;
 
                 param_set
                     .param_define_page("Main")?
                     .set_children(&[
                         "ProjectGroup",
+                        "RollingShutterGroup",
+                        "ManualLensGroup",
                         "AdjustGroup",
                         "KeyframesGroup",
-                        "ToggleOverview", "DontDrawOutside", "IncludeProjectData"
+                        "ToggleOverview", "DontDrawOutside", "IncludeProjectData", "InfoGroup", WEBSITE_PARAM
                     ])?;
 
                 OK
@@ -695,9 +1230,9 @@ impl Execute for GyroflowPlugin {
                 let mut effect_properties: EffectDescriptor = effect.properties()?;
                 effect_properties.set_grouping("Warp")?;
 
-                effect_properties.set_label("Gyroflow")?;
-                effect_properties.set_short_label("Gyroflow")?;
-                effect_properties.set_long_label("Gyroflow")?;
+                effect_properties.set_label("Gyroflow (Omni)")?;
+                effect_properties.set_short_label("Gyroflow (Omni)")?;
+                effect_properties.set_long_label(PLUGIN_LABEL)?;
 
                 effect_properties.set_supported_pixel_depths(&[BitDepth::Byte, BitDepth::Short, BitDepth::Float])?;
                 effect_properties.set_supported_contexts(&[ImageEffectContext::Filter])?;
