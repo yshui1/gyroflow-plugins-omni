@@ -373,6 +373,31 @@ pub(crate) fn sidecar_metadata(stab: &StabilizationManager) -> Value {
     stab.gyro.read().file_metadata.read().additional_data[SIDECAR_METADATA].clone()
 }
 
+/// The focal length of a prime in a lens name such as "85mm F2.0"; None for a zoom ("28-70mm") or no length
+fn prime_focal_mm(lens_model: &str) -> Option<f64> {
+    let name = lens_model.trim_start();
+    let digits = name.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(name.len());
+    let rest = name[digits..].trim_start();
+    if !rest.get(..2).is_some_and(|unit| unit.eq_ignore_ascii_case("mm")) { return None; }
+    name[..digits].parse::<f64>().ok()
+}
+
+/// The focal length (mm) and the width of the recorded sensor area (mm) of the clip's metadata sidecar, the lens
+/// profile that the SIGMA fp II writes beside each take: its focal length, else the prime's in its lens name, and the
+/// sensor width from its calibration width at the focal length in pixels
+pub(crate) fn sidecar_lens(stab: &StabilizationManager) -> (Option<f64>, Option<f64>) {
+    let sidecar = sidecar_metadata(stab);
+    let valid = |mm: f64| (mm.is_finite() && mm > 0.0 && mm < 10000.0).then_some(mm);
+    let focal_mm = sidecar["focal_length"].as_f64().and_then(valid)
+        .or_else(|| sidecar["lens_model"].as_str().and_then(prime_focal_mm).and_then(valid));
+    let sensor_width_mm = focal_mm.and_then(|mm| {
+        let width = sidecar["calib_dimension"]["w"].as_f64()?;
+        let fx = sidecar["fisheye_params"]["camera_matrix"][0][0].as_f64().filter(|fx| fx.is_finite() && *fx > 0.0)?;
+        Some(width * mm / fx).filter(|w| w.is_finite() && *w > 1.0 && *w < 100.0)
+    });
+    (focal_mm, sensor_width_mm)
+}
+
 pub(crate) fn sidecar_readout(stab: &StabilizationManager) -> Option<(f64, ReadoutDirection)> {
     let gyro = stab.gyro.read();
     let metadata = gyro.file_metadata.read();
@@ -476,6 +501,37 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_lens_reads_the_sigma_fp2_profile() {
+        assert_eq!(prime_focal_mm("85mm F2.0"), Some(85.0));
+        assert_eq!(prime_focal_mm(" 17.5 mm F1.4"), Some(17.5));
+        assert_eq!(prime_focal_mm("28-70mm F2.8"), None);
+        assert_eq!(prime_focal_mm("Manual lens"), None);
+        assert_eq!(prime_focal_mm(""), None);
+
+        let with = |sidecar: Value| {
+            let stab = StabilizationManager::default();
+            {
+                let mut gyro = stab.gyro.write();
+                let mut md = gyro.file_metadata.read().clone();
+                md.additional_data = serde_json::json!({ SIDECAR_METADATA: sidecar });
+                gyro.file_metadata = md.into();
+            }
+            sidecar_lens(&stab)
+        };
+        // A001_216_20261124.JSON: 6K (4:3) with the 85mm F2 DG DN
+        let (focal, sensor) = with(serde_json::json!({
+            "lens_model": "85mm F2.0", "calib_dimension": { "w": 5348, "h": 4012 }, "focal_length": null,
+            "fisheye_params": { "camera_matrix": [[14309.764, 0.0, 2674.0], [0.0, 14309.764, 2006.0], [0.0, 0.0, 1.0]] }
+        }));
+        assert_eq!(focal, Some(85.0));
+        assert!((sensor.unwrap() - 31.767).abs() < 0.001, "{sensor:?}");
+        // Its own focal length over the name's
+        assert_eq!(with(serde_json::json!({ "lens_model": "85mm F2.0", "focal_length": 84.5 })).0, Some(84.5));
+        assert_eq!(with(serde_json::json!({ "lens_model": "24-70mm F2.8" })), (None, None));
+        assert_eq!(with(Value::Null), (None, None));
+    }
+
+    #[test]
     fn video_load_uses_matching_motion_sidecars() {
         let directory =
             std::env::temp_dir().join(format!("gyroflow-sidecars-{}", fastrand::u64(..)));
@@ -501,6 +557,8 @@ mod tests {
         assert_eq!(stab.input_file.read().url, url);
         assert_eq!(sidecar_metadata(&stab)["lens_model"], "58mm F2.0");
         assert_eq!(sidecar_metadata(&stab)["frame_readout_time"], 15.237);
+        // The prime's focal length from its name; no camera matrix, no sensor width
+        assert_eq!(sidecar_lens(&stab), (Some(58.0), None));
         assert!(stab.gyro.read().quaternions.len() >= 2);
         assert!(
             filesystem::get_filename(&stab.gyro.read().file_url)

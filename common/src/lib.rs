@@ -506,7 +506,7 @@ impl GyroflowPluginBase {
             ParameterType::Group { id: "ManualLensGroup", label: "Generic profile", opened: false, parameters: vec![
                 ParameterType::Checkbox { id: "ManualLens",           label: "Use generic profile",          hint: "Stabilize with an uncalibrated lens of the focal length below, in place of the clip's lens profile and any profile loaded with Load preset/lens profile. For a lens without a profile, such as one without electronic contacts.", default: false },
                 ParameterType::Slider   { id: "ManualFocalLength",    label: "Lens focal (mm)",              hint: "The lens's focal length in mm. Set from the clip's metadata when it has one, while Use generic profile is off.", min: 1.0, max: 1000.0, default: 50.0 },
-                ParameterType::Slider   { id: "ManualSensorWidth",    label: "Sensor width (mm)",            hint: "The width of the sensor area the clip records, in mm (36 = full frame, about 23.5 = APS-C / Super 35). The clip's own value is used when it reports one (Sony, SIGMA fp CinemaDNG), and set here while Use generic profile is off.", min: 1.0, max: 100.0, default: 36.0 },
+                ParameterType::Slider   { id: "ManualSensorWidth",    label: "Sensor width (mm)",            hint: "The width of the sensor area the clip records, in mm (36 = full frame, about 23.5 = APS-C / Super 35). The clip's own value is used when it reports one (Sony, SIGMA fp CinemaDNG, SIGMA fp II), and set here while Use generic profile is off.", min: 1.0, max: 100.0, default: 36.0 },
                 ParameterType::Checkbox { id: "ManualDistortionAuto", label: "Typical distortion for focal", hint: "The barrel distortion typical of the focal length (from Gyroflow's lens database), for RAW. Off: use Corner distortion, 0 for video the camera already corrected.", default: true },
                 ParameterType::Slider   { id: "ManualDistortion",     label: "Corner distortion (%)",        hint: "With Typical distortion off: the frame corner against an ideal lens. Negative = barrel, positive = pincushion, 0 = none.", min: -30.0, max: 10.0, default: 0.0 },
             ] },
@@ -3194,6 +3194,40 @@ mod tests {
         instance.param_changed(&mut params, &cache(), Params::ManualLens, true).unwrap();
         let stab = instance.stab_manager(&mut params, &cache(), (3840, 2160), false).unwrap();
         assert_eq!(stab.lens.read().fisheye_params.camera_matrix[0][0], calibrated_fx);
+    }
+
+    /// GYROFLOW_GENERIC_SIGMA_FP2_CLIP=<a SIGMA fp II .MOV with its .JSON sidecar, e.g. A001_216_20261124.MOV (85mm F2)>
+    #[test]
+    #[ignore = "requires a SIGMA fp II clip and its metadata sidecar"]
+    fn generic_profile_fills_from_the_sigma_fp2_sidecar() {
+        let path = std::env::var("GYROFLOW_GENERIC_SIGMA_FP2_CLIP").unwrap();
+        let mut params = params();
+        params.set_string(Params::ProjectPath, &path).unwrap();
+        params.set_f64(Params::VideoSpeed, 100.0).unwrap();
+        params.set_bool(Params::ManualDistortionAuto, false).unwrap();
+        params.set_f64(Params::ManualFocalLength, 50.0).unwrap();
+        params.set_f64(Params::ManualSensorWidth, 36.0).unwrap();
+
+        let mut instance = GyroflowPluginBaseInstance { reload_values_from_project: false, ..Default::default() };
+        let stab = instance.stab_manager(&mut params, &cache(), (5348, 4012), false).unwrap();
+        let (sidecar_focal, sidecar_sensor) = video_metadata::sidecar_lens(&stab);
+        let focal = params.get_f64(Params::ManualFocalLength).unwrap();
+        let sensor = params.get_f64(Params::ManualSensorWidth).unwrap();
+        println!("sidecar: {sidecar_focal:?} mm, sensor {sidecar_sensor:?} mm; filled in: focal {focal} mm, sensor width {sensor} mm");
+        assert_eq!(Some(focal), sidecar_focal);
+        assert!((sensor - (sidecar_sensor.unwrap() * 100.0).round() / 100.0).abs() < 1e-9);
+
+        // On: the generic profile reproduces the camera's own focal length in pixels
+        params.set_bool(Params::ManualLens, true).unwrap();
+        instance.param_changed(&mut params, &cache(), Params::ManualLens, true).unwrap();
+        let stab = instance.stab_manager(&mut params, &cache(), (5348, 4012), false).unwrap();
+        let lens = stab.lens.read();
+        let (width, fx) = (stab.params.read().size.0 as f64, lens.fisheye_params.camera_matrix[0][0]);
+        let camera_fx = video_metadata::sidecar_metadata(&stab)["fisheye_params"]["camera_matrix"][0][0].as_f64().unwrap()
+            * width / video_metadata::sidecar_metadata(&stab)["calib_dimension"]["w"].as_f64().unwrap();
+        println!("on: {} fx {fx:.1} (camera {camera_fx:.1})", lens.lens_model);
+        assert!(lens.lens_model.starts_with("Generic profile"));
+        assert!((fx / camera_fx - 1.0).abs() < 0.001);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! other clip gets a lens profile synthesized here.
 use gyroflow_core::StabilizationManager;
 use gyroflow_core::lens_profile::{ CameraParams, Dimensions, LensProfile };
-use crate::{ fsg2, lensfit };
+use crate::{ fsg2, lensfit, video_metadata };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ManualLens {
@@ -45,29 +45,34 @@ impl ManualLens {
 }
 
 /// The width of the sensor area the clip records, in mm, from its lens metadata: pixel pitch times capture area
-/// (Sony), or the frame width at the focal length in pixels (SIGMA fp CinemaDNG)
+/// (Sony), the frame width at the focal length in pixels (SIGMA fp CinemaDNG), or the metadata sidecar's lens
+/// profile (SIGMA fp II)
 pub fn clip_sensor_width_mm(stab: &StabilizationManager) -> Option<f64> {
     let width = stab.params.read().size.0 as f64;
-    let gyro = stab.gyro.read();
-    let md = gyro.file_metadata.read();
-    let valid = |mm: f64| (mm.is_finite() && mm > 1.0 && mm < 100.0).then_some(mm);
-    md.lens_params.values().find_map(|l| {
-        let (pitch, area) = (l.pixel_pitch?, l.capture_area_size?);
-        valid(pitch.0 as f64 / 1_000_000.0 * area.0 as f64)
-    }).or_else(|| md.lens_params.values().find_map(|l| {
-        let (mm, px) = (l.focal_length? as f64, l.pixel_focal_length?.0 as f64);
-        valid(width * mm / px)
-    }))
+    let from_frames = {
+        let gyro = stab.gyro.read();
+        let md = gyro.file_metadata.read();
+        let valid = |mm: f64| (mm.is_finite() && mm > 1.0 && mm < 100.0).then_some(mm);
+        md.lens_params.values().find_map(|l| {
+            let (pitch, area) = (l.pixel_pitch?, l.capture_area_size?);
+            valid(pitch.0 as f64 / 1_000_000.0 * area.0 as f64)
+        }).or_else(|| md.lens_params.values().find_map(|l| {
+            let (mm, px) = (l.focal_length? as f64, l.pixel_focal_length?.0 as f64);
+            valid(width * mm / px)
+        }))
+    };
+    from_frames.or_else(|| video_metadata::sidecar_lens(stab).1)
 }
 
-/// The focal length (mm) and the sensor width (mm) of the clip's lens metadata, where it has them
+/// The focal length (mm) and the sensor width (mm) of the clip's lens metadata, where it has them: per frame, else
+/// from the metadata sidecar (SIGMA fp II)
 pub fn clip_lens_metadata(stab: &StabilizationManager) -> (Option<f64>, Option<f64>) {
     let focal_mm = {
         let gyro = stab.gyro.read();
         let md = gyro.file_metadata.read();
         md.lens_params.values().find_map(|l| l.focal_length.map(f64::from).filter(|mm| mm.is_finite() && *mm > 0.0))
     };
-    (focal_mm, clip_sensor_width_mm(stab))
+    (focal_mm.or_else(|| video_metadata::sidecar_lens(stab).0), clip_sensor_width_mm(stab))
 }
 
 /// Replaces the lens with the generic one, sized on the clip's own sensor area when it reports it
